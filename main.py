@@ -1,147 +1,350 @@
 """
-Companies House Real-Time Monitor - Main FastAPI Application
-Dashboard + API endpoints for viewing screened companies
+Companies House Real-Time Monitor - Single Service Version
+Combined SSE streaming + FastAPI dashboard with SQLite storage
 """
+
 import os
 import json
 import asyncio
-from datetime import datetime
-from typing import Optional, List
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 import asyncpg
+import httpx
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 # Configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/companies")
-API_KEY = os.getenv("API_KEY", "")
+API_KEY = os.environ.get("API_KEY", "")
+SSE_URL = os.environ.get("SSE_URL", "https://stream.companieshouse.gov.uk/")
+DATABASE_FILE = os.environ.get("DATABASE_FILE", "/data/companies.db")
+PORT = int(os.environ.get("PORT", "8000"))
 
-# Target SIC codes
+# Target SIC codes (software/tech/finance)
 TARGET_SIC_CODES = {
-    "62011", "62012", "62020", "62030", "62090",  # Software
-    "63110", "63120", "63910", "63990",  # Web/IT
-    "64999", "66190", "66220", "66300",  # Finance
+    "62011", "62012", "62020", "62030", "62090",  # Software development
+    "63110", "63120", "63910", "63990",  # Web portals/IT
+    "64999", "66190", "66220", "66300",  # Finance/Investment
     "70229", "72110", "72190", "72200",  # Consulting/R&D
-    "73110", "73120", "73200",  # Advertising
-    "74100", "74200", "74300", "74900",  # Design
-    "82990", "85590", "86900", "87900",  # Business services
-    "90030", "91010", "91020", "93290",  # Arts
+    "73110", "73120", "73200",  # Advertising/Market research
+    "74100", "74200", "74300", "74900",  # Design/Professional
+    "82990", "85590", "86900", "87900",  # Other business services
+    "90030", "91010", "91020", "93290",  # Arts/Recreation
 }
 
-# Buzzwords
+# Buzzwords to match in company names
 BUZZWORDS = [" AI"]  # Space before to avoid false positives
 
+# Restricted SIC codes (optional - for filtering out unwanted types)
+RESTRICTED_SIC_CODES = {
+    "64209", "64301", "64302", "64303", "64304", "64305", "64306", "64309",
+    "64910", "64920", "64991", "64992", "64993", "64994", "64995", "64996",
+    "65110", "65120", "65200", "65300",
+}
 
-async def get_db_pool():
-    """Create database connection pool"""
-    return await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+# In-memory store for SSE clients
+sse_clients: List[asyncio.Queue] = []
 
-
-# Global database pool
-db_pool = None
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Manage database pool lifecycle"""
-    global db_pool
-    db_pool = await get_db_pool()
-    yield
-    await db_pool.close()
+# Global database connection
+db_conn: Optional[asyncpg.Connection] = None
 
 
-app = FastAPI(lifespan=lifespan)
+def init_db_schema(conn):
+    """Initialize database schema"""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS screened_companies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_number TEXT UNIQUE NOT NULL,
+            company_name TEXT NOT NULL,
+            incorporation_date TEXT NOT NULL,
+            sic_codes TEXT,
+            source_type TEXT NOT NULL,
+            published_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_published_at 
+        ON screened_companies(published_at DESC)
+    """)
 
 
-def matches_criteria(sic_codes: List[str], company_name: str) -> tuple[bool, str]:
-    """Check if company matches target SIC codes or buzzwords"""
-    # Priority 1: Target SIC code
+async def get_db_connection():
+    """Get SQLite connection via aiosqlite"""
+    import aiosqlite
+    
+    db_path = Path(DATABASE_FILE)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    conn = await aiosqlite.connect(str(db_path))
+    conn.row_factory = aiosqlite.Row
+    
+    # Initialize schema
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS screened_companies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_number TEXT UNIQUE NOT NULL,
+            company_name TEXT NOT NULL,
+            incorporation_date TEXT NOT NULL,
+            sic_codes TEXT,
+            source_type TEXT NOT NULL,
+            published_at TEXT NOT NULL
+        )
+    """)
+    await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_published_at 
+        ON screened_companies(published_at DESC)
+    """)
+    
+    return conn
+
+
+def matches_criteria(data: Dict[str, Any]) -> Optional[str]:
+    """Check if company matches target SIC or buzzwords"""
+    company_name = data.get("company_name", "")
+    sic_codes = data.get("sic_codes", [])
+    
+    # Priority 1: Check target SIC codes
     for sic in sic_codes:
         if sic in TARGET_SIC_CODES:
-            return True, "target_sic"
+            return "target_sic"
     
-    # Priority 2: Buzzword in name
+    # Priority 2: Check buzzwords
     for buzzword in BUZZWORDS:
         if buzzword in company_name:
-            return True, "buzzword"
+            return "buzzword"
     
-    return False, ""
+    return None
 
 
-@app.get("/", response_class=HTMLResponse)
-async def dashboard():
-    """Serve the main dashboard"""
-    return HTMLResponse(content=HTML_TEMPLATE)
+async def process_stream():
+    """Process Companies House SSE stream"""
+    global db_conn
+    
+    timepoint_file = Path("/data/timepoint.txt")
+    timepoint_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Load last timepoint
+    last_timepoint = None
+    if timepoint_file.exists():
+        last_timepoint = timepoint_file.read_text().strip()
+        print(f"Loaded timepoint: {last_timepoint}")
+    
+    print("Starting stream processor...")
+    
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                auth = (API_KEY, "")
+                headers = {"Accept": "application/json"}
+                
+                if last_timepoint:
+                    headers["Last-Event-ID"] = last_timepoint
+                
+                print(f"Connecting to stream: {SSE_URL}")
+                
+                async with client.stream(
+                    "GET",
+                    SSE_URL,
+                    auth=auth,
+                    headers=headers,
+                ) as response:
+                    if response.status_code != 200:
+                        print(f"Stream connection failed: {response.status_code}")
+                        await asyncio.sleep(5)
+                        continue
+                    
+                    print("Stream connected successfully")
+                    
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        
+                        if line.startswith("data: "):
+                            data_str = line[6:]
+                            try:
+                                data = json.loads(data_str)
+                                
+                                # Extract company data
+                                company_data = {
+                                    "company_number": data.get("company_number", ""),
+                                    "company_name": data.get("company_name", ""),
+                                    "incorporation_date": data.get("incorporation_date", ""),
+                                    "sic_codes": data.get("sic_codes", []),
+                                    "type": data.get("type", ""),
+                                }
+                                
+                                # Check if matches criteria
+                                source_type = matches_criteria(company_data)
+                                
+                                if source_type:
+                                    # Store in database
+                                    published_at = datetime.now(timezone.utc).isoformat()
+                                    
+                                    try:
+                                        await db_conn.execute(
+                                            """
+                                            INSERT OR REPLACE INTO screened_companies 
+                                            (company_number, company_name, incorporation_date, sic_codes, source_type, published_at)
+                                            VALUES (?, ?, ?, ?, ?, ?)
+                                            """,
+                                            (
+                                                company_data["company_number"],
+                                                company_data["company_name"],
+                                                company_data["incorporation_date"],
+                                                json.dumps(company_data["sic_codes"]),
+                                                source_type,
+                                                published_at,
+                                            ),
+                                        )
+                                        print(f"Stored: {company_data['company_number']} - {company_data['company_name']}")
+                                        
+                                        # Notify SSE clients
+                                        notification = {
+                                            "type": "new_company",
+                                            "data": {
+                                                "company_number": company_data["company_number"],
+                                                "company_name": company_data["company_name"],
+                                                "sic_codes": company_data["sic_codes"],
+                                                "source_type": source_type,
+                                                "published_at": published_at,
+                                            },
+                                        }
+                                        
+                                        for queue in sse_clients:
+                                            await queue.put(notification)
+                                    
+                                    except Exception as e:
+                                        print(f"Database error: {e}")
+                                
+                                # Update timepoint
+                                if "id" in data:
+                                    last_timepoint = data["id"]
+                                    timepoint_file.write_text(last_timepoint)
+                            
+                            except json.JSONDecodeError as e:
+                                print(f"JSON decode error: {e}")
+                                continue
+                        
+                        elif line.startswith("id: "):
+                            last_timepoint = line[4:]
+                            timepoint_file.write_text(last_timepoint)
+        
+        except Exception as e:
+            print(f"Stream error: {e}")
+            print("Reconnecting in 5 seconds...")
+            await asyncio.sleep(5)
 
 
-@app.get("/api/companies")
-async def get_companies(limit: int = 100):
-    """Get recent screened companies"""
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT company_number, company_name, incorporation_date, sic_codes, 
-                   source_type, published_at, created_at
-            FROM screened_companies
-            ORDER BY published_at DESC
-            LIMIT $1
-            """,
-            limit
-        )
+async def get_today_count():
+    """Get count of companies matched today"""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    row = await db_conn.execute_fetchone(
+        "SELECT COUNT(*) FROM screened_companies WHERE DATE(published_at) = ?",
+        (today,)
+    )
+    return row[0] if row else 0
+
+
+async def get_recent_companies(limit: int = 100):
+    """Get most recent companies"""
+    rows = await db_conn.execute_fetchall(
+        """
+        SELECT company_number, company_name, sic_codes, source_type, published_at
+        FROM screened_companies
+        ORDER BY published_at DESC
+        LIMIT ?
+        """,
+        (limit,)
+    )
     
     companies = []
     for row in rows:
         companies.append({
-            "company_number": row["company_number"],
-            "company_name": row["company_name"],
-            "incorporation_date": row["incorporation_date"],
-            "sic_codes": json.loads(row["sic_codes"]) if row["sic_codes"] else [],
-            "source_type": row["source_type"],
-            "published_at": row["published_at"],
-            "created_at": row["created_at"].isoformat(),
+            "company_number": row[0],
+            "company_name": row[1],
+            "sic_codes": json.loads(row[2]) if row[2] else [],
+            "source_type": row[3],
+            "published_at": row[4],
         })
     
-    return JSONResponse(content={"companies": companies})
+    return companies
 
 
-@app.get("/api/metrics")
-async def get_metrics():
-    """Get real-time metrics"""
-    async with db_pool.acquire() as conn:
-        # Count companies incorporated today
-        today = datetime.utcnow().date().isoformat()
-        row = await conn.fetchrow(
-            """
-            SELECT 
-                COUNT(*) as total,
-                COUNT(*) FILTER (WHERE source_type = 'target_sic') as target_sic,
-                COUNT(*) FILTER (WHERE source_type = 'buzzword') as buzzword
-            FROM screened_companies
-            WHERE incorporation_date = $1
-            """,
-            today
-        )
+# FastAPI App
+app = FastAPI(title="Companies House Monitor")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.on_event("startup")
+async def startup():
+    """Initialize database and start stream processor"""
+    global db_conn
     
-    return JSONResponse(content={
-        "total": row["total"] or 0,
-        "target_sic": row["target_sic"] or 0,
-        "buzzword": row["buzzword"] or 0,
-        "timestamp": datetime.utcnow().isoformat(),
-    })
+    print("Starting Companies House Monitor...")
+    db_conn = await get_db_connection()
+    print(f"Database initialized: {DATABASE_FILE}")
+    
+    # Start stream processor in background
+    asyncio.create_task(process_stream())
 
 
 @app.get("/health")
-async def health_check():
+async def health():
     """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
-# HTML Dashboard Template
-HTML_TEMPLATE = """
+@app.get("/api/metrics")
+async def metrics():
+    """Get current metrics"""
+    today_count = await get_today_count()
+    return {
+        "target_sic_buzzword_count": today_count,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/companies")
+async def list_companies(limit: int = 100):
+    """Get recent companies"""
+    companies = await get_recent_companies(limit)
+    return {"companies": companies, "count": len(companies)}
+
+
+@app.get("/stream")
+async def sse_stream():
+    """SSE endpoint for real-time updates"""
+    from fastapi.responses import StreamingResponse
+    
+    queue = asyncio.Queue()
+    sse_clients.append(queue)
+    
+    async def generate():
+        try:
+            while True:
+                notification = await queue.get()
+                yield f"data: {json.dumps(notification)}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            sse_clients.remove(queue)
+    
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    """Main dashboard HTML"""
+    return """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -150,7 +353,7 @@ HTML_TEMPLATE = """
     <title>Companies House Real-Time Monitor</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
+        body { 
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: #f5f5f5;
             padding: 20px;
@@ -158,11 +361,10 @@ HTML_TEMPLATE = """
         .container { max-width: 1400px; margin: 0 auto; }
         h1 { color: #333; margin-bottom: 20px; }
         
-        /* Metrics */
-        .metrics {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
+        .metrics { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
+            gap: 20px; 
             margin-bottom: 30px;
         }
         .metric-card {
@@ -172,21 +374,34 @@ HTML_TEMPLATE = """
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
         .metric-label { color: #666; font-size: 14px; margin-bottom: 8px; }
-        .metric-value { font-size: 32px; font-weight: bold; }
-        .metric-value.green { color: #10b981; }
+        .metric-value { font-size: 32px; font-weight: bold; color: #22c55e; }
         .metric-value.blue { color: #3b82f6; }
-        .status-indicator {
-            display: inline-block;
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            margin-right: 8px;
-        }
-        .status-indicator.live { background: #10b981; }
-        .status-indicator.disconnected { background: #ef4444; }
+        .metric-value.red { color: #ef4444; }
         
-        /* Table */
-        .table-container {
+        .connection-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background: #f0fdf4;
+            border-radius: 20px;
+            font-size: 14px;
+            color: #16a34a;
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #22c55e;
+            animation: pulse 2s infinite;
+        }
+        .status-dot.disconnected { background: #ef4444; animation: none; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .companies-table {
             background: white;
             border-radius: 8px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
@@ -196,31 +411,40 @@ HTML_TEMPLATE = """
         th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid #eee; }
         th { background: #f9fafb; font-weight: 600; color: #374151; }
         tr:hover { background: #f9fafb; }
-        tr.new-row { background: #d1fae5; animation: fadeOut 3s forwards; }
-        @keyframes fadeOut {
-            to { background: white; }
-        }
+        tr.new-row { background: #dcfce7; transition: background 0.3s; }
+        
         .company-number { font-family: 'Courier New', monospace; font-size: 13px; }
         .sic-badge {
             display: inline-block;
+            padding: 4px 8px;
             background: #dbeafe;
             color: #1e40af;
-            padding: 2px 8px;
-            border-radius: 12px;
+            border-radius: 4px;
             font-size: 12px;
-            margin: 2px;
+            margin-right: 4px;
         }
         .type-badge {
             display: inline-block;
-            padding: 2px 8px;
-            border-radius: 12px;
+            padding: 4px 8px;
+            border-radius: 4px;
             font-size: 12px;
             font-weight: 500;
         }
-        .type-badge.target_sic { background: #10b981; color: white; }
-        .type-badge.buzzword { background: #f59e0b; color: white; }
+        .type-badge.target_sic { background: #dcfce7; color: #166534; }
+        .type-badge.buzzword { background: #fef3c7; color: #92400e; }
+        
+        .time-ago { color: #6b7280; font-size: 13px; }
+        
+        .links a {
+            color: #3b82f6;
+            text-decoration: none;
+            margin-right: 12px;
+            font-size: 13px;
+        }
+        .links a:hover { text-decoration: underline; }
+        
         .copy-btn {
-            background: #e5e7eb;
+            background: #f3f4f6;
             border: none;
             padding: 4px 8px;
             border-radius: 4px;
@@ -228,21 +452,9 @@ HTML_TEMPLATE = """
             font-size: 12px;
             margin-left: 8px;
         }
-        .copy-btn:hover { background: #d1d5db; }
-        .time-ago { color: #6b7280; font-size: 13px; }
-        .links a {
-            color: #3b82f6;
-            text-decoration: none;
-            margin-right: 12px;
-        }
-        .links a:hover { text-decoration: underline; }
+        .copy-btn:hover { background: #e5e7eb; }
         
-        /* Responsive */
-        @media (max-width: 768px) {
-            .metrics { grid-template-columns: 1fr; }
-            table { font-size: 13px; }
-            th, td { padding: 8px; }
-        }
+        .loading { text-align: center; padding: 40px; color: #6b7280; }
     </style>
 </head>
 <body>
@@ -251,23 +463,19 @@ HTML_TEMPLATE = """
         
         <div class="metrics">
             <div class="metric-card">
-                <div class="metric-label">
-                    <span class="status-indicator live" id="status"></span>
-                    Connection Status
+                <div class="metric-label">Connection Status</div>
+                <div class="connection-status">
+                    <span class="status-dot" id="statusDot"></span>
+                    <span id="statusText">Connecting...</span>
                 </div>
-                <div class="metric-value" id="status-text">Connecting...</div>
             </div>
             <div class="metric-card">
                 <div class="metric-label">Target SIC + Buzzword (Today)</div>
-                <div class="metric-value green" id="target-count">-</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Total Companies (Today)</div>
-                <div class="metric-value blue" id="total-count">-</div>
+                <div class="metric-value" id="targetCount">-</div>
             </div>
         </div>
         
-        <div class="table-container">
+        <div class="companies-table">
             <table>
                 <thead>
                     <tr>
@@ -279,124 +487,179 @@ HTML_TEMPLATE = """
                         <th>Links</th>
                     </tr>
                 </thead>
-                <tbody id="companies-table">
+                <tbody id="companiesTable">
+                    <tr><td colspan="6" class="loading">Loading companies...</td></tr>
                 </tbody>
             </table>
         </div>
     </div>
-
+    
     <script>
-        let lastCompanyNumber = null;
+        let eventSource = null;
         
-        // Fetch companies
-        async function fetchCompanies() {
-            try {
-                const response = await fetch('/api/companies?limit=50');
-                const data = await response.json();
-                renderTable(data.companies);
-                updateStatus(true);
-            } catch (error) {
-                console.error('Error fetching companies:', error);
-                updateStatus(false);
-            }
-        }
-        
-        // Fetch metrics
-        async function fetchMetrics() {
-            try {
-                const response = await fetch('/api/metrics');
-                const data = await response.json();
-                document.getElementById('target-count').textContent = data.target_sic + data.buzzword;
-                document.getElementById('total-count').textContent = data.total;
-            } catch (error) {
-                console.error('Error fetching metrics:', error);
-            }
-        }
-        
-        // Render table
-        function renderTable(companies) {
-            const tbody = document.getElementById('companies-table');
-            tbody.innerHTML = '';
+        function formatTimeAgo(timestamp) {
+            const now = new Date();
+            const then = new Date(timestamp);
+            const diff = Math.floor((now - then) / 1000);
             
-            companies.forEach((company, index) => {
-                const tr = document.createElement('tr');
-                if (company.company_number === lastCompanyNumber && index === 0) {
-                    tr.classList.add('new-row');
-                }
-                
-                const sicBadges = company.sic_codes.map(sic => 
-                    `<span class="sic-badge">${sic}</span>`
-                ).join('');
-                
-                const timeAgo = getTimeAgo(new Date(company.published_at));
-                
-                tr.innerHTML = `
-                    <td class="company-number">${company.company_number}</td>
-                    <td>
-                        ${company.company_name}
-                        <button class="copy-btn" onclick="copyName('${company.company_name.replace(/'/g, "\\'")}')">Copy</button>
-                    </td>
-                    <td>${sicBadges}</td>
-                    <td><span class="type-badge ${company.source_type}">${company.source_type}</span></td>
-                    <td class="time-ago">${timeAgo}</td>
-                    <td class="links">
-                        <a href="https://find-and-update.company-information.service.gov.uk/company/${company.company_number}" target="_blank">CH</a>
-                        <a href="https://www.google.com/search?q=${encodeURIComponent(company.company_name)}" target="_blank">Google</a>
-                    </td>
-                `;
-                tbody.appendChild(tr);
-            });
-            
-            if (companies.length > 0) {
-                lastCompanyNumber = companies[0].company_number;
-            }
+            if (diff < 60) return diff + 's';
+            if (diff < 3600) return Math.floor(diff / 60) + 'm';
+            if (diff < 86400) return Math.floor(diff / 3600) + 'h';
+            return Math.floor(diff / 86400) + 'd';
         }
         
-        // Update connection status
-        function updateStatus(isLive) {
-            const indicator = document.getElementById('status');
-            const text = document.getElementById('status-text');
-            if (isLive) {
-                indicator.classList.remove('disconnected');
-                indicator.classList.add('live');
+        function updateStatus(connected) {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+            
+            if (connected) {
+                dot.classList.remove('disconnected');
                 text.textContent = 'Live';
             } else {
-                indicator.classList.remove('live');
-                indicator.classList.add('disconnected');
+                dot.classList.add('disconnected');
                 text.textContent = 'Disconnected';
             }
         }
         
-        // Time ago helper
-        function getTimeAgo(date) {
-            const seconds = Math.floor((new Date() - date) / 1000);
-            if (seconds < 60) return `${seconds}s`;
-            const minutes = Math.floor(seconds / 60);
-            if (minutes < 60) return `${minutes}m`;
-            const hours = Math.floor(minutes / 60);
-            if (hours < 24) return `${hours}h`;
-            const days = Math.floor(hours / 24);
-            return `${days}d`;
+        async function loadMetrics() {
+            try {
+                const response = await fetch('/api/metrics');
+                const data = await response.json();
+                document.getElementById('targetCount').textContent = data.target_sic_buzzword_count;
+            } catch (error) {
+                console.error('Error loading metrics:', error);
+            }
         }
         
-        // Copy name
+        async function loadCompanies() {
+            try {
+                const response = await fetch('/api/companies?limit=100');
+                const data = await response.json();
+                renderCompanies(data.companies);
+            } catch (error) {
+                console.error('Error loading companies:', error);
+            }
+        }
+        
+        function renderCompanies(companies) {
+            const tbody = document.getElementById('companiesTable');
+            
+            if (companies.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="loading">No companies found yet</td></tr>';
+                return;
+            }
+            
+            tbody.innerHTML = companies.map(company => {
+                const sicBadges = company.sic_codes.map(sic => 
+                    `<span class="sic-badge">${sic}</span>`
+                ).join('');
+                
+                const typeClass = company.source_type === 'target_sic' ? 'target_sic' : 'buzzword';
+                const typeLabel = company.source_type === 'target_sic' ? 'Target SIC' : 'Buzzword';
+                
+                return `
+                    <tr class="company-row" data-number="${company.company_number}">
+                        <td class="company-number">
+                            ${company.company_number}
+                            <button class="copy-btn" onclick="copyName('${company.company_name.replace(/'/g, "\\'")}')">Copy</button>
+                        </td>
+                        <td>${company.company_name}</td>
+                        <td>${sicBadges}</td>
+                        <td><span class="type-badge ${typeClass}">${typeLabel}</span></td>
+                        <td class="time-ago">${formatTimeAgo(company.published_at)}</td>
+                        <td class="links">
+                            <a href="https://find-and-update.company-information.service.gov.uk/company/${company.company_number}" target="_blank">CH</a>
+                            <a href="https://www.google.com/search?q=${encodeURIComponent(company.company_name)}" target="_blank">Google</a>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+        
+        function addCompany(company) {
+            const tbody = document.getElementById('companiesTable');
+            const existingRow = tbody.querySelector(`[data-number="${company.company_number}"]`);
+            
+            if (existingRow) return;
+            
+            const sicBadges = company.sic_codes.map(sic => 
+                `<span class="sic-badge">${sic}</span>`
+            ).join('');
+            
+            const typeClass = company.source_type === 'target_sic' ? 'target_sic' : 'buzzword';
+            const typeLabel = company.source_type === 'target_sic' ? 'Target SIC' : 'Buzzword';
+            
+            const row = document.createElement('tr');
+            row.className = 'company-row new-row';
+            row.dataset.number = company.company_number;
+            row.innerHTML = `
+                <td class="company-number">
+                    ${company.company_number}
+                    <button class="copy-btn" onclick="copyName('${company.company_name.replace(/'/g, "\\'")}')">Copy</button>
+                </td>
+                <td>${company.company_name}</td>
+                <td>${sicBadges}</td>
+                <td><span class="type-badge ${typeClass}">${typeLabel}</span></td>
+                <td class="time-ago">Just now</td>
+                <td class="links">
+                    <a href="https://find-and-update.company-information.service.gov.uk/company/${company.company_number}" target="_blank">CH</a>
+                    <a href="https://www.google.com/search?q=${encodeURIComponent(company.company_name)}" target="_blank">Google</a>
+                </td>
+            `;
+            
+            tbody.insertBefore(row, tbody.firstChild);
+            
+            // Remove new-row highlight after 3 seconds
+            setTimeout(() => {
+                row.classList.remove('new-row');
+            }, 3000);
+            
+            // Keep only 100 rows
+            while (tbody.children.length > 100) {
+                tbody.removeChild(tbody.lastChild);
+            }
+        }
+        
         function copyName(name) {
             navigator.clipboard.writeText(name);
         }
         
-        // Initial fetch
-        fetchCompanies();
-        fetchMetrics();
+        function connectSSE() {
+            eventSource = new EventSource('/stream');
+            
+            eventSource.onopen = () => {
+                updateStatus(true);
+            };
+            
+            eventSource.onmessage = (event) => {
+                const notification = JSON.parse(event.data);
+                if (notification.type === 'new_company') {
+                    addCompany(notification.data);
+                    loadMetrics();
+                }
+            };
+            
+            eventSource.onerror = () => {
+                updateStatus(false);
+                eventSource.close();
+                setTimeout(connectSSE, 5000);
+            };
+        }
         
-        // Refresh intervals
-        setInterval(fetchCompanies, 5000);
-        setInterval(fetchMetrics, 5000);
+        // Initial load
+        loadMetrics();
+        loadCompanies();
+        
+        // Refresh metrics every 5 seconds
+        setInterval(loadMetrics, 5000);
+        
+        // Connect SSE
+        connectSSE();
     </script>
 </body>
 </html>
-"""
+    """
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
