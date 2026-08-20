@@ -4,7 +4,7 @@ services:
     name: companies-house-dashboard
     env: docker
     region: frankfurt
-    plan: standard-256mb
+    plan: starter
     dockerContext: .
     dockerfilePath: ./Dockerfile
     envVars:
