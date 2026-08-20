@@ -3,7 +3,7 @@ services:
   - type: web
     name: companies-house-dashboard
     env: python
-    region: london
+    region: frankfurt
     plan: free
     buildCommand: ""
     startCommand: python main.py
@@ -23,7 +23,7 @@ services:
   - type: worker
     name: companies-house-stream-worker
     env: python
-    region: london
+    region: frankfurt
     plan: starter
     buildCommand: ""
     startCommand: python stream_worker.py
