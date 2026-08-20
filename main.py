@@ -18,7 +18,7 @@ import aiosqlite
 
 # Configuration
 API_KEY = os.environ.get("API_KEY", "")
-SSE_URL = os.environ.get("SSE_URL", "https://stream.companieshouse.gov.uk/")
+SSE_URL = os.environ.get("SSE_URL", "https://stream.companieshouse.gov.uk/companies")
 DATABASE_FILE = os.environ.get("DATABASE_FILE", "/data/companies.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -124,6 +124,12 @@ async def process_stream():
                 ) as response:
                     if response.status_code != 200:
                         print(f"Stream connection failed: {response.status_code}")
+                        # Try to read error body
+                        try:
+                            error_body = await response.text()
+                            print(f"Error response: {error_body[:200]}")
+                        except:
+                            pass
                         await asyncio.sleep(5)
                         continue
                     
