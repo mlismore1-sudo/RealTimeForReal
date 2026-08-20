@@ -43,14 +43,21 @@ sse_clients: List[asyncio.Queue] = []
 # Global database connection
 db_conn: Optional[aiosqlite.Connection] = None
 
+# Counter for debugging
+companies_seen = 0
+companies_matched = 0
+
 
 def matches_criteria(data: Dict[str, Any]) -> Optional[str]:
     """Check if company matches target SIC or buzzwords"""
     company_name = data.get("company_name", "")
     sic_codes = data.get("sic_codes", [])
     
+    # Convert SIC codes to strings (handle both int and str)
+    sic_codes_str = [str(sic) for sic in sic_codes]
+    
     # Priority 1: Check target SIC codes
-    for sic in sic_codes:
+    for sic in sic_codes_str:
         if sic in TARGET_SIC_CODES:
             return "target_sic"
     
@@ -92,7 +99,7 @@ async def get_db_connection():
 
 async def process_stream():
     """Process Companies House SSE stream"""
-    global db_conn
+    global db_conn, companies_seen, companies_matched
     
     timepoint_file = Path("/data/timepoint.txt")
     timepoint_file.parent.mkdir(parents=True, exist_ok=True)
@@ -124,7 +131,6 @@ async def process_stream():
                 ) as response:
                     if response.status_code != 200:
                         print(f"Stream connection failed: {response.status_code}")
-                        # Try to read error body
                         try:
                             error_body = await response.text()
                             print(f"Error response: {error_body[:200]}")
@@ -153,10 +159,20 @@ async def process_stream():
                                     "type": data.get("type", ""),
                                 }
                                 
+                                # Debug: Log every 100th company
+                                companies_seen += 1
+                                if companies_seen % 100 == 0:
+                                    print(f"DEBUG: Seen {companies_seen} companies, {companies_matched} matched")
+                                    print(f"  Latest: {company_data['company_number']} - {company_data['company_name']}")
+                                    print(f"  SIC codes: {company_data['sic_codes']}")
+                                
                                 # Check if matches criteria
                                 source_type = matches_criteria(company_data)
                                 
                                 if source_type:
+                                    companies_matched += 1
+                                    print(f"MATCH #{companies_matched}: {company_data['company_number']} - {company_data['company_name']} (type: {source_type})")
+                                    
                                     # Store in database
                                     published_at = datetime.now(timezone.utc).isoformat()
                                     
