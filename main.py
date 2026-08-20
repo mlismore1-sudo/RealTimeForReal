@@ -40,6 +40,7 @@ for group_name, group_sics in SIC_GROUPS.items():
     for sic in group_sics:
         SIC_TO_GROUP[sic] = group_name
 
+# Buzzwords - case insensitive matching
 BUZZWORDS = [
     "UK", "Group", "Labs", "Technologies", "Tech", "Capital",
     " AI", "Europe", "EMEA", "Inc", "Asset", "Assets",
@@ -50,6 +51,8 @@ sse_clients: List[asyncio.Queue] = []
 db_conn: Optional[aiosqlite.Connection] = None
 companies_seen = 0
 companies_matched = 0
+buzzword_matches = 0
+target_sic_matches = 0
 
 
 def get_sic_group(sic_code: str) -> Optional[str]:
@@ -57,16 +60,25 @@ def get_sic_group(sic_code: str) -> Optional[str]:
 
 
 def matches_criteria(data: Dict[str, Any]) -> Optional[str]:
+    """Check if company matches target SIC or buzzwords"""
+    global buzzword_matches, target_sic_matches
+    
     company_name = data.get("company_name", "")
     sic_codes = data.get("sic_codes", [])
     sic_codes_str = [str(sic) for sic in sic_codes]
     
+    # Priority 1: Check target SIC codes
     for sic in sic_codes_str:
         if sic in ALL_TARGET_SICS:
+            target_sic_matches += 1
             return "target_sic"
     
+    # Priority 2: Check buzzwords (case insensitive)
+    company_name_upper = company_name.upper()
     for buzzword in BUZZWORDS:
-        if buzzword in company_name:
+        if buzzword.upper() in company_name_upper:
+            buzzword_matches += 1
+            print(f"  BUZZWORD MATCH: '{buzzword}' in '{company_name}'", flush=True)
             return "buzzword"
     
     return None
@@ -102,7 +114,7 @@ async def get_db_connection():
 
 
 async def process_stream():
-    global db_conn, companies_seen, companies_matched
+    global db_conn, companies_seen, companies_matched, buzzword_matches, target_sic_matches
     
     timepoint_file = Path("/data/timepoint.txt")
     timepoint_file.parent.mkdir(parents=True, exist_ok=True)
@@ -157,7 +169,7 @@ async def process_stream():
                             "type": data.get("data", {}).get("type", ""),
                         }
                         
-                        if companies_seen <= 20 or companies_seen % 100 == 0:
+                        if companies_seen <= 50 or companies_seen % 100 == 0:
                             print(f"DEBUG #{companies_seen}: {company_data['company_number']} - {company_data['company_name']}", flush=True)
                             print(f"  SIC: {company_data['sic_codes']}", flush=True)
                             print(f"  Incorp Date: {company_data['incorporation_date']}", flush=True)
@@ -247,7 +259,12 @@ async def metrics():
         (today,)
     )
     row = await cursor.fetchone()
-    return {"target_sic_buzzword_count": row[0] if row else 0, "date": today}
+    return {
+        "target_sic_buzzword_count": row[0] if row else 0,
+        "date": today,
+        "buzzword_matches": buzzword_matches,
+        "target_sic_matches": target_sic_matches,
+    }
 
 
 @app.get("/api/companies")
@@ -347,6 +364,8 @@ async def dashboard():
         .time-ago { color: #6b7280; font-size: 13px; white-space: nowrap; }
         .links a { color: #3b82f6; text-decoration: none; margin-right: 12px; }
         .copy-btn { background: #f3f4f6; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; margin-left: 8px; font-size: 12px; }
+        .enable-sound-btn { background: #3b82f6; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; margin-left: 12px; }
+        .enable-sound-btn:hover { background: #2563eb; }
     </style>
 </head>
 <body>
@@ -356,7 +375,7 @@ async def dashboard():
         <div class="metrics">
             <div class="metric-card">
                 <div class="metric-label">Status</div>
-                <div class="connection-status"><span class="status-dot" id="statusDot"></span><span id="statusText">Connecting...</span></div>
+                <div class="connection-status"><span class="status-dot" id="statusDot"></span><span id="statusText">Connecting...</span><button class="enable-sound-btn" id="enableSoundBtn" onclick="enableSound()">Enable Sound</button></div>
             </div>
             <div class="metric-card">
                 <div class="metric-label">Target Companies Incorporated Today</div>
@@ -383,6 +402,8 @@ async def dashboard():
     </div>
     <script>
         let es = null;
+        let soundEnabled = false;
+        
         function timeAgo(ts) {
             const d = Math.floor((new Date() - new Date(ts)) / 1000);
             if (d < 60) return d + 's';
@@ -401,6 +422,31 @@ async def dashboard():
         function updateDate() {
             const now = new Date();
             document.getElementById('currentDate').textContent = '📅 Showing companies incorporated on: ' + now.toLocaleDateString('en-GB', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+        }
+        function enableSound() {
+            soundEnabled = true;
+            playNotificationSound();
+            document.getElementById('enableSoundBtn').textContent = 'Sound Enabled ✓';
+        }
+        function playNotificationSound() {
+            if (!soundEnabled) return;
+            try {
+                const AudioContext = window.AudioContext || window.webkitAudioContext;
+                const audioContext = new AudioContext();
+                const oscillator = audioContext.createOscillator();
+                const gain = audioContext.createGain();
+                oscillator.type = 'sine';
+                oscillator.frequency.setValueAtTime(880, audioContext.currentTime);
+                oscillator.frequency.setValueAtTime(1175, audioContext.currentTime + 0.12);
+                gain.gain.setValueAtTime(0.08, audioContext.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + 0.32);
+                oscillator.connect(gain);
+                gain.connect(audioContext.destination);
+                oscillator.start();
+                oscillator.stop(audioContext.currentTime + 0.32);
+            } catch (error) {
+                console.warn('Sound unavailable:', error);
+            }
         }
         async function loadMetrics() {
             try {
@@ -450,11 +496,20 @@ async def dashboard():
             row.innerHTML = `<td class="company-number">${c.company_number}<button class="copy-btn" onclick="navigator.clipboard.writeText('${c.company_name.replace(/'/g, "\\'")}')">Copy</button></td><td>${c.company_name}</td><td>${sics}</td><td><span style="color:#999;font-size:12px;">-</span></td><td><span class="type-badge ${tc}">${tl}</span></td><td class="time-ago">-</td><td class="time-ago">Just now</td><td class="links"><a href="https://find-and-update.company-information.service.gov.uk/company/${c.company_number}" target="_blank">CH</a> <a href="https://google.com/search?q=${encodeURIComponent(c.company_name)}" target="_blank">Google</a></td>`;
             tb.insertBefore(row, tb.firstChild);
             while (tb.children.length > 200) tb.removeChild(tb.lastChild);
+            playNotificationSound();
         }
         function connect() {
             es = new EventSource('/stream');
             es.onopen = () => setStatus(true);
-            es.onmessage = e => { const n = JSON.parse(e.data); if (n.type === 'new_company') { addCompany(n.data); loadCompanies(); loadMetrics(); } };
+            es.onmessage = e => {
+                const n = JSON.parse(e.data);
+                if (n.type === 'new_company') {
+                    console.log('New company:', n.data.company_name, 'Type:', n.data.source_type);
+                    addCompany(n.data);
+                    loadCompanies();
+                    loadMetrics();
+                }
+            };
             es.onerror = () => { setStatus(false); es.close(); setTimeout(connect, 5000); };
         }
         updateDate(); loadMetrics(); loadCompanies();
