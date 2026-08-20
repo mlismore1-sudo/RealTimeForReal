@@ -5,7 +5,7 @@ services:
     env: python
     region: frankfurt
     plan: free
-    buildCommand: ""
+    buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
       - key: DATABASE_URL
@@ -25,7 +25,7 @@ services:
     env: python
     region: frankfurt
     plan: starter
-    buildCommand: ""
+    buildCommand: pip install -r requirements.txt
     startCommand: python stream_worker.py
     envVars:
       - key: DATABASE_URL
