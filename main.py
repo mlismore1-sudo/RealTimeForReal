@@ -6,15 +6,15 @@ Combined SSE streaming + FastAPI dashboard with SQLite storage
 import os
 import json
 import asyncio
-import asyncpg
 import httpx
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+import aiosqlite
 
 # Configuration
 API_KEY = os.environ.get("API_KEY", "")
@@ -37,43 +37,33 @@ TARGET_SIC_CODES = {
 # Buzzwords to match in company names
 BUZZWORDS = [" AI"]  # Space before to avoid false positives
 
-# Restricted SIC codes (optional - for filtering out unwanted types)
-RESTRICTED_SIC_CODES = {
-    "64209", "64301", "64302", "64303", "64304", "64305", "64306", "64309",
-    "64910", "64920", "64991", "64992", "64993", "64994", "64995", "64996",
-    "65110", "65120", "65200", "65300",
-}
-
 # In-memory store for SSE clients
 sse_clients: List[asyncio.Queue] = []
 
 # Global database connection
-db_conn: Optional[asyncpg.Connection] = None
+db_conn: Optional[aiosqlite.Connection] = None
 
 
-def init_db_schema(conn):
-    """Initialize database schema"""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS screened_companies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            company_number TEXT UNIQUE NOT NULL,
-            company_name TEXT NOT NULL,
-            incorporation_date TEXT NOT NULL,
-            sic_codes TEXT,
-            source_type TEXT NOT NULL,
-            published_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_published_at 
-        ON screened_companies(published_at DESC)
-    """)
+def matches_criteria(data: Dict[str, Any]) -> Optional[str]:
+    """Check if company matches target SIC or buzzwords"""
+    company_name = data.get("company_name", "")
+    sic_codes = data.get("sic_codes", [])
+    
+    # Priority 1: Check target SIC codes
+    for sic in sic_codes:
+        if sic in TARGET_SIC_CODES:
+            return "target_sic"
+    
+    # Priority 2: Check buzzwords
+    for buzzword in BUZZWORDS:
+        if buzzword in company_name:
+            return "buzzword"
+    
+    return None
 
 
 async def get_db_connection():
-    """Get SQLite connection via aiosqlite"""
-    import aiosqlite
-    
+    """Get SQLite connection"""
     db_path = Path(DATABASE_FILE)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -98,24 +88,6 @@ async def get_db_connection():
     """)
     
     return conn
-
-
-def matches_criteria(data: Dict[str, Any]) -> Optional[str]:
-    """Check if company matches target SIC or buzzwords"""
-    company_name = data.get("company_name", "")
-    sic_codes = data.get("sic_codes", [])
-    
-    # Priority 1: Check target SIC codes
-    for sic in sic_codes:
-        if sic in TARGET_SIC_CODES:
-            return "target_sic"
-    
-    # Priority 2: Check buzzwords
-    for buzzword in BUZZWORDS:
-        if buzzword in company_name:
-            return "buzzword"
-    
-    return None
 
 
 async def process_stream():
@@ -240,16 +212,17 @@ async def process_stream():
 async def get_today_count():
     """Get count of companies matched today"""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    row = await db_conn.execute_fetchone(
+    cursor = await db_conn.execute(
         "SELECT COUNT(*) FROM screened_companies WHERE DATE(published_at) = ?",
         (today,)
     )
+    row = await cursor.fetchone()
     return row[0] if row else 0
 
 
 async def get_recent_companies(limit: int = 100):
     """Get most recent companies"""
-    rows = await db_conn.execute_fetchall(
+    cursor = await db_conn.execute(
         """
         SELECT company_number, company_name, sic_codes, source_type, published_at
         FROM screened_companies
@@ -258,6 +231,7 @@ async def get_recent_companies(limit: int = 100):
         """,
         (limit,)
     )
+    rows = await cursor.fetchall()
     
     companies = []
     for row in rows:
@@ -316,7 +290,6 @@ async def list_companies(limit: int = 100):
 @app.get("/stream")
 async def sse_stream():
     """SSE endpoint for real-time updates"""
-    from fastapi.responses import StreamingResponse
     
     queue = asyncio.Queue()
     sse_clients.append(queue)
