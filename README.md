@@ -1,185 +1,134 @@
 Companies House Real-Time Monitor
 A real-time dashboard that monitors UK company incorporations and displays companies matching specific criteria (target SIC codes or buzzwords) with minimal delay.
 
+Features
+✅ Real-time SSE streaming from Companies House
+
+✅ Filter by target SIC codes (software/tech/finance)
+
+✅ Filter by buzzwords in company names (e.g., " AI")
+
+✅ SQLite database on persistent storage
+
+✅ Live dashboard with auto-refresh
+
+✅ Single service deployment (~$5.25/mo on Render)
+
 Architecture
 text
-┌─────────────────────┐      ┌─────────────────────┐
-│  Stream Worker      │      │  Dashboard (Web)    │
-│  (Background)       │      │                     │
-│                     │      │  FastAPI + HTML     │
-│  - SSE Connection   │      │                     │
-│  - Filter Logic     │─────▶│  - Metrics API      │
-│  - Store to DB      │      │  - Company Table    │
-└─────────────────────┘      └─────────────────────┘
-           │                            │
-           ▼                            ▼
-    ┌─────────────────────────────────────┐
-    │      PostgreSQL Database            │
-    │      (Render Managed)               │
-    └─────────────────────────────────────┘
-Why This Works (vs Previous Attempt)
-Issue	Previous	New Solution
-Database	SQLite on ephemeral disk	PostgreSQL (managed, persistent)
-Stream Processing	Web service (sleeps)	Background worker (always on)
-Timepoint Tracking	Not implemented	File-based persistent storage
-API Key	Possibly REST key	Requires Streaming API key
-Error Handling	Basic	Auto-reconnect, retry logic
-Prerequisites
-Companies House Streaming API Key (NOT the REST API key)
-
-Go to: https://developer.company-information.service.gov.uk/
-
-Create a new application specifically for streaming
-
-Copy the streaming API key
-
-Render Account
-
-Sign up at: https://render.com/
-
-Free tier available, but database requires paid plan after 30 days
-
-Setup Steps
-1. Create GitHub Repository
-
-bash
-# Create new repo on GitHub
-git init
-git add .
-git commit -m "Initial commit"
-git push origin main
-2. Connect to Render
-
-Go to https://render.com/dashboard
-
-Click "New +" → "Blueprint"
-
-Connect your GitHub repository
-
-Render will auto-detect render.yaml
-
-3. Configure Environment Variables
-
-In Render dashboard:
-
-Dashboard Service:
-
-Add API_KEY environment variable (your streaming API key)
-
-Stream Worker Service:
-
-Add API_KEY environment variable (same key)
-
-4. Deploy
-
-Render will automatically:
-
-Create PostgreSQL database
-
-Deploy dashboard web service (free tier)
-
-Deploy stream worker (standard-256mb, $7/mo)
-
-Attach persistent disk to worker
-
-5. Verify
-
-Dashboard URL: https://[your-app].onrender.com
-
-Check worker logs in Render dashboard
-
-Verify companies appearing in table
-
+┌─────────────────────────────────────┐
+│   Single Web Service (Render)       │
+│                                     │
+│  ┌───────────────────────────────┐  │
+│  │  FastAPI Dashboard            │  │
+│  │  - HTML/JS frontend           │  │
+│  │  - REST API endpoints         │  │
+│  │  - SSE streaming endpoint     │  │
+│  └───────────────────────────────┘  │
+│                                     │
+│  ┌───────────────────────────────┐  │
+│  │  SSE Stream Processor         │  │
+│  │  - Connects to CH stream      │  │
+│  │  - Filters by SIC/buzzwords   │  │
+│  │  - Stores in SQLite           │  │
+│  └───────────────────────────────┘  │
+│                                     │
+│  ┌───────────────────────────────┐  │
+│  │  SQLite Database              │  │
+│  │  - /data/companies.db         │  │
+│  └───────────────────────────────┘  │
+└─────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────┐
+│  Persistent Disk (1GB)              │
+│  - companies.db                     │
+│  - timepoint.txt                    │
+└─────────────────────────────────────┘
 Target SIC Codes
 text
-62011, 62012, 62020, 62030, 62090  (Software)
-63110, 63120, 63910, 63990         (Web/IT)
-64999, 66190, 66220, 66300         (Finance)
+62011, 62012, 62020, 62030, 62090  (Software development)
+63110, 63120, 63910, 63990         (Web portals/IT)
+64999, 66190, 66220, 66300         (Finance/Investment)
 70229, 72110, 72190, 72200         (Consulting/R&D)
-73110, 73120, 73200                (Advertising)
-74100, 74200, 74300, 74900         (Design)
-82990, 85590, 86900, 87900         (Business services)
+73110, 73120, 73200                (Advertising/Market research)
+74100, 74200, 74300, 74900         (Design/Professional)
+82990, 85590, 86900, 87900         (Other business services)
 90030, 91010, 91020, 93290         (Arts/Recreation)
 Buzzwords
-" AI" (with leading space to avoid false positives)
+AI (with space to avoid false positives)
 
-Cost Breakdown
-Service	Plan	Cost
-Dashboard	Free	$0/mo
-Stream Worker	Standard-256mb	$7/mo
-PostgreSQL	Basic-256mb	$6/mo (after 30-day trial)
-Disk (1GB)	Persistent	$0.25/mo
-Total		~$13.25/mo
-Troubleshooting
-No Companies Appearing
+Deployment
+1. Get Companies House Streaming API Key
 
-Check worker logs for "Stream connected successfully"
+Go to https://developer.company-information.service.gov.uk/signin
 
-Verify API_KEY is set correctly
+Create a NEW application with Streaming API access
 
-Check if timepoint is being saved
+Copy the API key
 
-Verify database connection in logs
+2. Deploy to Render
 
-Worker Crashes
+bash
+# Push code to GitHub
+git add .
+git commit -m "Deploy Companies House Monitor"
+git push
 
-Check logs for error messages
+# In Render Dashboard:
+# 1. Click "New +" → "Blueprint"
+# 2. Select your repo
+# 3. Click "Deploy Blueprint"
+3. Add Environment Variable
 
-Verify API key has streaming access (not REST)
+In Render Dashboard:
 
-Check disk is mounted at /data
+Go to service → Environment tab
 
-Database Connection Errors
+Add: API_KEY = your streaming API key
 
-Verify DATABASE_URL is auto-populated from database
+Save and wait for redeploy
 
-Check database is in same region (London)
+4. Access Dashboard
 
-Restart services if needed
-
-High Latency
-
-Check worker logs for processing time
-
-Verify REST API rate limits (600/5min)
-
-Consider caching company details
+Open your Render service URL (e.g., https://your-app.onrender.com)
 
 API Endpoints
-GET / - Dashboard HTML
-
-GET /api/companies?limit=100 - Recent companies
-
-GET /api/metrics - Real-time metrics
+GET / - Main dashboard
 
 GET /health - Health check
 
-Local Development
-bash
-# Install dependencies
-pip install -r requirements.txt
+GET /api/metrics - Current metrics
 
-# Set environment variables
-export DATABASE_URL="postgresql://..."
-export API_KEY="your-key"
+GET /api/companies?limit=100 - Recent companies
 
-# Run dashboard
-python main.py
+GET /stream - SSE endpoint for real-time updates
 
-# Run worker (separate terminal)
-python stream_worker.py
-Monitoring
-Render Dashboard: View logs, metrics, uptime
+Cost
+Component	Cost
+Web Service (Standard-256mb)	$5/mo
+Persistent Disk (1GB)	$0.25/mo
+Total	$5.25/mo
+Troubleshooting
+No companies appearing?
 
-Database: Query screened_companies table
+Check service logs for "Stream connected successfully"
 
-Timepoint: Check /data/timepoint.txt on worker
+Verify API_KEY is set correctly (must be streaming key, not REST)
 
-Support
-For issues:
+Check Companies House API status
 
-Check Render service logs
+Database errors?
 
-Verify Companies House API status
+Verify disk is mounted at /data
 
-Test SSE connection locally first
+Check logs for specific error messages
+
+Service keeps restarting?
+
+Check disk is properly attached
+
+Verify all environment variables are set
+
+License
+MIT
