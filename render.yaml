@@ -2,11 +2,11 @@ services:
   # Web Service - Dashboard
   - type: web
     name: companies-house-dashboard
-    env: python
+    env: docker
     region: frankfurt
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: DATABASE_URL
         fromDatabase:
@@ -22,11 +22,12 @@ services:
   # Background Worker - Stream Processor
   - type: worker
     name: companies-house-stream-worker
-    env: python
+    env: docker
     region: frankfurt
     plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: python stream_worker.py
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    dockerCommand: python stream_worker.py
     envVars:
       - key: DATABASE_URL
         fromDatabase:
