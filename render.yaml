@@ -24,7 +24,7 @@ services:
     name: companies-house-stream-worker
     env: python
     region: london
-    plan: standard-256mb
+    plan: starter
     buildCommand: ""
     startCommand: python stream_worker.py
     envVars:
