@@ -1,5 +1,6 @@
 """
 Companies House Real-Time Monitor - Production Version
+Filters by incorporation date (today's date)
 """
 
 import os
@@ -30,25 +31,21 @@ SIC_GROUPS = {
     "Space & Aviation": {"30300", "72190", "33160"},
 }
 
-# Flatten for matching
 ALL_TARGET_SICS = set()
 for group_sics in SIC_GROUPS.values():
     ALL_TARGET_SICS.update(group_sics)
 
-# Create reverse mapping (sic -> group name)
 SIC_TO_GROUP = {}
 for group_name, group_sics in SIC_GROUPS.items():
     for sic in group_sics:
         SIC_TO_GROUP[sic] = group_name
 
-# Buzzwords
 BUZZWORDS = [
     "UK", "Group", "Labs", "Technologies", "Tech", "Capital",
     " AI", "Europe", "EMEA", "Inc", "Asset", "Assets",
     "Partners", "Ventures", "Investments", "Equity", "Marine", "Yacht"
 ]
 
-# Global state
 sse_clients: List[asyncio.Queue] = []
 db_conn: Optional[aiosqlite.Connection] = None
 companies_seen = 0
@@ -56,22 +53,18 @@ companies_matched = 0
 
 
 def get_sic_group(sic_code: str) -> Optional[str]:
-    """Get the group name for a SIC code"""
     return SIC_TO_GROUP.get(str(sic_code))
 
 
 def matches_criteria(data: Dict[str, Any]) -> Optional[str]:
-    """Check if company matches target SIC or buzzwords"""
     company_name = data.get("company_name", "")
     sic_codes = data.get("sic_codes", [])
     sic_codes_str = [str(sic) for sic in sic_codes]
     
-    # Priority 1: Check target SIC codes
     for sic in sic_codes_str:
         if sic in ALL_TARGET_SICS:
             return "target_sic"
     
-    # Priority 2: Check buzzwords
     for buzzword in BUZZWORDS:
         if buzzword in company_name:
             return "buzzword"
@@ -80,14 +73,13 @@ def matches_criteria(data: Dict[str, Any]) -> Optional[str]:
 
 
 async def get_db_connection():
-    """Get SQLite connection"""
     db_path = Path(DATABASE_FILE)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     
     conn = await aiosqlite.connect(str(db_path))
     conn.row_factory = aiosqlite.Row
     
-    # Schema with unique constraint on company_number + date
+    # Create table if not exists
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS screened_companies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,24 +89,19 @@ async def get_db_connection():
             sic_codes TEXT,
             source_type TEXT NOT NULL,
             published_at TEXT NOT NULL,
-            date_added TEXT NOT NULL,
-            UNIQUE(company_number, date_added)
+            UNIQUE(company_number, incorporation_date)
         )
     """)
+    
     await conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_date_added 
-        ON screened_companies(date_added DESC, published_at DESC)
-    """)
-    await conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_company_number 
-        ON screened_companies(company_number, date_added)
+        CREATE INDEX IF NOT EXISTS idx_incorporation_date 
+        ON screened_companies(incorporation_date DESC, published_at DESC)
     """)
     
     return conn
 
 
 async def process_stream():
-    """Process Companies House SSE stream"""
     global db_conn, companies_seen, companies_matched
     
     timepoint_file = Path("/data/timepoint.txt")
@@ -162,7 +149,6 @@ async def process_stream():
                         
                         companies_seen += 1
                         
-                        # Extract company data
                         company_data = {
                             "company_number": data.get("data", {}).get("company_number", ""),
                             "company_name": data.get("data", {}).get("company_name", ""),
@@ -174,6 +160,7 @@ async def process_stream():
                         if companies_seen <= 20 or companies_seen % 100 == 0:
                             print(f"DEBUG #{companies_seen}: {company_data['company_number']} - {company_data['company_name']}", flush=True)
                             print(f"  SIC: {company_data['sic_codes']}", flush=True)
+                            print(f"  Incorp Date: {company_data['incorporation_date']}", flush=True)
                         
                         source_type = matches_criteria(company_data)
                         
@@ -181,16 +168,14 @@ async def process_stream():
                             companies_matched += 1
                             print(f"MATCH #{companies_matched}: {company_data['company_number']} - {company_data['company_name']} ({source_type})", flush=True)
                             
-                            # Use today's date for deduplication
-                            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                             published_at = datetime.now(timezone.utc).isoformat()
                             
                             try:
                                 await db_conn.execute(
                                     """
                                     INSERT OR IGNORE INTO screened_companies 
-                                    (company_number, company_name, incorporation_date, sic_codes, source_type, published_at, date_added)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                                    (company_number, company_name, incorporation_date, sic_codes, source_type, published_at)
+                                    VALUES (?, ?, ?, ?, ?, ?)
                                     """,
                                     (
                                         company_data["company_number"],
@@ -199,11 +184,9 @@ async def process_stream():
                                         json.dumps(company_data["sic_codes"]),
                                         source_type,
                                         published_at,
-                                        today,
                                     ),
                                 )
                                 
-                                # Check if inserted (not ignored due to duplicate)
                                 if db_conn.total_changes > 0:
                                     print(f"Stored: {company_data['company_number']} - {company_data['company_name']}", flush=True)
                                     
@@ -215,6 +198,7 @@ async def process_stream():
                                             "sic_codes": company_data["sic_codes"],
                                             "source_type": source_type,
                                             "published_at": published_at,
+                                            "incorporation_date": company_data["incorporation_date"],
                                         },
                                     }
                                     
@@ -224,7 +208,6 @@ async def process_stream():
                             except Exception as e:
                                 print(f"Database error: {e}", flush=True)
                         
-                        # Update timepoint
                         event = data.get("event", {})
                         if "timepoint" in event:
                             last_timepoint = str(event["timepoint"])
@@ -236,7 +219,6 @@ async def process_stream():
             await asyncio.sleep(5)
 
 
-# FastAPI App
 app = FastAPI(title="Companies House Monitor")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -261,7 +243,7 @@ async def health():
 async def metrics():
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cursor = await db_conn.execute(
-        "SELECT COUNT(*) FROM screened_companies WHERE date_added = ?",
+        "SELECT COUNT(*) FROM screened_companies WHERE incorporation_date = ?",
         (today,)
     )
     row = await cursor.fetchone()
@@ -276,7 +258,7 @@ async def list_companies(limit: int = 100):
         """
         SELECT company_number, company_name, sic_codes, source_type, published_at, incorporation_date
         FROM screened_companies
-        WHERE date_added = ?
+        WHERE incorporation_date = ?
         ORDER BY published_at DESC
         LIMIT ?
         """,
@@ -287,7 +269,6 @@ async def list_companies(limit: int = 100):
     companies = []
     for row in rows:
         sic_codes = json.loads(row[2]) if row[2] else []
-        # Get SIC groups
         sic_groups = []
         for sic in sic_codes:
             group = get_sic_group(str(sic))
@@ -366,10 +347,6 @@ async def dashboard():
         .time-ago { color: #6b7280; font-size: 13px; white-space: nowrap; }
         .links a { color: #3b82f6; text-decoration: none; margin-right: 12px; }
         .copy-btn { background: #f3f4f6; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; margin-left: 8px; font-size: 12px; }
-        .director-flag { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-left: 6px; }
-        .director-flag.eu { background: #dbeafe; color: #1e40af; }
-        .director-flag.usa { background: #fee2e2; color: #991b1b; }
-        .director-flag.india { background: #fef3c7; color: #92400e; }
     </style>
 </head>
 <body>
@@ -382,7 +359,7 @@ async def dashboard():
                 <div class="connection-status"><span class="status-dot" id="statusDot"></span><span id="statusText">Connecting...</span></div>
             </div>
             <div class="metric-card">
-                <div class="metric-label">Target Companies (Today)</div>
+                <div class="metric-label">Target Companies Incorporated Today</div>
                 <div class="metric-value" id="targetCount">-</div>
             </div>
         </div>
@@ -406,7 +383,6 @@ async def dashboard():
     </div>
     <script>
         let es = null;
-        
         function timeAgo(ts) {
             const d = Math.floor((new Date() - new Date(ts)) / 1000);
             if (d < 60) return d + 's';
@@ -414,22 +390,18 @@ async def dashboard():
             if (d < 86400) return Math.floor(d / 3600) + 'h';
             return Math.floor(d / 86400) + 'd';
         }
-        
         function formatDate(isoString) {
             const d = new Date(isoString);
             return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
         }
-        
         function setStatus(ok) {
             document.getElementById('statusDot').style.opacity = ok ? '1' : '0.5';
             document.getElementById('statusText').textContent = ok ? 'Live' : 'Disconnected';
         }
-        
         function updateDate() {
             const now = new Date();
-            document.getElementById('currentDate').textContent = '📅 ' + now.toLocaleDateString('en-GB', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+            document.getElementById('currentDate').textContent = '📅 Showing companies incorporated on: ' + now.toLocaleDateString('en-GB', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
         }
-        
         async function loadMetrics() {
             try {
                 const r = await fetch('/api/metrics');
@@ -438,24 +410,20 @@ async def dashboard():
                 if (d.date) updateDate();
             } catch(e) {}
         }
-        
         async function loadCompanies() {
             try {
                 const r = await fetch('/api/companies?limit=200');
                 const d = await r.json();
                 const tb = document.getElementById('companiesTable');
-                
                 if (!d.companies.length) {
-                    tb.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:40px;">No companies found yet</td></tr>';
+                    tb.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:40px;">No companies incorporated today yet</td></tr>';
                     return;
                 }
-                
                 tb.innerHTML = d.companies.map(c => {
                     const sics = c.sic_codes.map(s => `<span class="sic-badge">${s}</span>`).join('');
                     const groups = c.sic_groups && c.sic_groups.length ? c.sic_groups.map(g => `<span class="sic-group">${g.group}</span>`).join('') : '<span style="color:#999;font-size:12px;">-</span>';
                     const tc = c.source_type === 'target_sic' ? 'target_sic' : 'buzzword';
                     const tl = c.source_type === 'target_sic' ? 'Target SIC' : 'Buzzword';
-                    
                     return `<tr class="company-row" data-number="${c.company_number}">
                         <td class="company-number">${c.company_number}<button class="copy-btn" onclick="navigator.clipboard.writeText('${c.company_name.replace(/'/g, "\\'")}')">Copy</button></td>
                         <td>${c.company_name}</td>
@@ -464,59 +432,32 @@ async def dashboard():
                         <td><span class="type-badge ${tc}">${tl}</span></td>
                         <td class="time-ago">${formatDate(c.incorporation_date)}</td>
                         <td class="time-ago">${timeAgo(c.published_at)}</td>
-                        <td class="links">
-                            <a href="https://find-and-update.company-information.service.gov.uk/company/${c.company_number}" target="_blank">CH</a>
-                            <a href="https://google.com/search?q=${encodeURIComponent(c.company_name)}" target="_blank">Google</a>
-                        </td>
+                        <td class="links"><a href="https://find-and-update.company-information.service.gov.uk/company/${c.company_number}" target="_blank">CH</a> <a href="https://google.com/search?q=${encodeURIComponent(c.company_name)}" target="_blank">Google</a></td>
                     </tr>`;
                 }).join('');
-            } catch(e) {
-                console.error('Error loading companies:', e);
-            }
+            } catch(e) { console.error('Error:', e); }
         }
-        
         function addCompany(c) {
             const tb = document.getElementById('companiesTable');
             const existing = tb.querySelector(`[data-number="${c.company_number}"]`);
             if (existing) return;
-            
             const sics = c.sic_codes.map(s => `<span class="sic-badge">${s}</span>`).join('');
             const tc = c.source_type === 'target_sic' ? 'target_sic' : 'buzzword';
             const tl = c.source_type === 'target_sic' ? 'Target SIC' : 'Buzzword';
-            
             const row = document.createElement('tr');
             row.className = 'company-row new-row';
             row.dataset.number = c.company_number;
-            row.innerHTML = `<td class="company-number">${c.company_number}<button class="copy-btn" onclick="navigator.clipboard.writeText('${c.company_name.replace(/'/g, "\\'")}')">Copy</button></td>
-                <td>${c.company_name}</td>
-                <td>${sics}</td>
-                <td><span style="color:#999;font-size:12px;">-</span></td>
-                <td><span class="type-badge ${tc}">${tl}</span></td>
-                <td class="time-ago">-</td>
-                <td class="time-ago">Just now</td>
-                <td class="links"><a href="https://find-and-update.company-information.service.gov.uk/company/${c.company_number}" target="_blank">CH</a> <a href="https://google.com/search?q=${encodeURIComponent(c.company_name)}" target="_blank">Google</a></td>`;
-            
+            row.innerHTML = `<td class="company-number">${c.company_number}<button class="copy-btn" onclick="navigator.clipboard.writeText('${c.company_name.replace(/'/g, "\\'")}')">Copy</button></td><td>${c.company_name}</td><td>${sics}</td><td><span style="color:#999;font-size:12px;">-</span></td><td><span class="type-badge ${tc}">${tl}</span></td><td class="time-ago">-</td><td class="time-ago">Just now</td><td class="links"><a href="https://find-and-update.company-information.service.gov.uk/company/${c.company_number}" target="_blank">CH</a> <a href="https://google.com/search?q=${encodeURIComponent(c.company_name)}" target="_blank">Google</a></td>`;
             tb.insertBefore(row, tb.firstChild);
             while (tb.children.length > 200) tb.removeChild(tb.lastChild);
         }
-        
         function connect() {
             es = new EventSource('/stream');
             es.onopen = () => setStatus(true);
-            es.onmessage = e => {
-                const n = JSON.parse(e.data);
-                if (n.type === 'new_company') {
-                    addCompany(n.data);
-                    loadCompanies();
-                    loadMetrics();
-                }
-            };
+            es.onmessage = e => { const n = JSON.parse(e.data); if (n.type === 'new_company') { addCompany(n.data); loadCompanies(); loadMetrics(); } };
             es.onerror = () => { setStatus(false); es.close(); setTimeout(connect, 5000); };
         }
-        
-        updateDate();
-        loadMetrics();
-        loadCompanies();
+        updateDate(); loadMetrics(); loadCompanies();
         setInterval(loadMetrics, 5000);
         connect();
     </script>
