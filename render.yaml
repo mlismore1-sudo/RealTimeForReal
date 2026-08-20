@@ -1,0 +1,51 @@
+services:
+  # Web Service - Dashboard
+  - type: web
+    name: companies-house-dashboard
+    env: python
+    region: london
+    plan: free
+    buildCommand: ""
+    startCommand: python main.py
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: companies-db
+          property: connectionString
+      - key: API_KEY
+        sync: false
+      - key: PORT
+        value: 8000
+    healthCheckPath: /health
+    autoDeploy: true
+
+  # Background Worker - Stream Processor
+  - type: worker
+    name: companies-house-stream-worker
+    env: python
+    region: london
+    plan: standard-256mb
+    buildCommand: ""
+    startCommand: python stream_worker.py
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: companies-db
+          property: connectionString
+      - key: API_KEY
+        sync: false
+      - key: SSE_URL
+        value: https://stream.companieshouse.gov.uk/
+      - key: TIMEPOINT_FILE
+        value: /data/timepoint.txt
+    disk:
+      name: stream-worker-data
+      mountPath: /data
+      sizeGB: 1
+    autoDeploy: true
+
+databases:
+  - name: companies-db
+    databaseName: companies
+    plan: basic-256mb
+    ipAllowList: []
