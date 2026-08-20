@@ -110,7 +110,7 @@ async def process_stream():
         last_timepoint = timepoint_file.read_text().strip()
         print(f"Loaded timepoint: {last_timepoint}")
     
-    print("Starting stream processor...")
+    print("Starting stream processor...", flush=True)
     
     while True:
         try:
@@ -121,7 +121,7 @@ async def process_stream():
                 if last_timepoint:
                     headers["Last-Event-ID"] = last_timepoint
                 
-                print(f"Connecting to stream: {SSE_URL}")
+                print(f"Connecting to stream: {SSE_URL}", flush=True)
                 
                 async with client.stream(
                     "GET",
@@ -130,16 +130,16 @@ async def process_stream():
                     headers=headers,
                 ) as response:
                     if response.status_code != 200:
-                        print(f"Stream connection failed: {response.status_code}")
+                        print(f"Stream connection failed: {response.status_code}", flush=True)
                         try:
                             error_body = await response.text()
-                            print(f"Error response: {error_body[:200]}")
+                            print(f"Error response: {error_body[:200]}", flush=True)
                         except:
                             pass
                         await asyncio.sleep(5)
                         continue
                     
-                    print("Stream connected successfully")
+                    print("Stream connected successfully", flush=True)
                     
                     async for line in response.aiter_lines():
                         if not line:
@@ -150,28 +150,28 @@ async def process_stream():
                             try:
                                 data = json.loads(data_str)
                                 
-                                # Extract company data
+                                # Extract company data - FIXED: nested inside "data" key
                                 company_data = {
-                                    "company_number": data.get("company_number", ""),
-                                    "company_name": data.get("company_name", ""),
-                                    "incorporation_date": data.get("incorporation_date", ""),
-                                    "sic_codes": data.get("sic_codes", []),
-                                    "type": data.get("type", ""),
+                                    "company_number": data.get("data", {}).get("company_number", ""),
+                                    "company_name": data.get("data", {}).get("company_name", ""),
+                                    "incorporation_date": data.get("data", {}).get("date_of_creation", ""),
+                                    "sic_codes": data.get("data", {}).get("sic_codes", []),
+                                    "type": data.get("data", {}).get("type", ""),
                                 }
                                 
-                                # Debug: Log every 100th company
+                                # Debug: Log every 10th company
                                 companies_seen += 1
-                                if companies_seen % 100 == 0:
-                                    print(f"DEBUG: Seen {companies_seen} companies, {companies_matched} matched")
-                                    print(f"  Latest: {company_data['company_number']} - {company_data['company_name']}")
-                                    print(f"  SIC codes: {company_data['sic_codes']}")
+                                if companies_seen % 10 == 0:
+                                    print(f"DEBUG: Seen {companies_seen} companies, {companies_matched} matched", flush=True)
+                                    print(f"  Latest: {company_data['company_number']} - {company_data['company_name']}", flush=True)
+                                    print(f"  SIC codes: {company_data['sic_codes']}", flush=True)
                                 
                                 # Check if matches criteria
                                 source_type = matches_criteria(company_data)
                                 
                                 if source_type:
                                     companies_matched += 1
-                                    print(f"MATCH #{companies_matched}: {company_data['company_number']} - {company_data['company_name']} (type: {source_type})")
+                                    print(f"MATCH #{companies_matched}: {company_data['company_number']} - {company_data['company_name']} (type: {source_type})", flush=True)
                                     
                                     # Store in database
                                     published_at = datetime.now(timezone.utc).isoformat()
@@ -192,7 +192,7 @@ async def process_stream():
                                                 published_at,
                                             ),
                                         )
-                                        print(f"Stored: {company_data['company_number']} - {company_data['company_name']}")
+                                        print(f"Stored: {company_data['company_number']} - {company_data['company_name']}", flush=True)
                                         
                                         # Notify SSE clients
                                         notification = {
@@ -210,15 +210,16 @@ async def process_stream():
                                             await queue.put(notification)
                                     
                                     except Exception as e:
-                                        print(f"Database error: {e}")
+                                        print(f"Database error: {e}", flush=True)
                                 
                                 # Update timepoint
-                                if "id" in data:
-                                    last_timepoint = data["id"]
+                                event = data.get("event", {})
+                                if "timepoint" in event:
+                                    last_timepoint = str(event["timepoint"])
                                     timepoint_file.write_text(last_timepoint)
                             
                             except json.JSONDecodeError as e:
-                                print(f"JSON decode error: {e}")
+                                print(f"JSON decode error: {e}", flush=True)
                                 continue
                         
                         elif line.startswith("id: "):
@@ -226,15 +227,19 @@ async def process_stream():
                             timepoint_file.write_text(last_timepoint)
         
         except Exception as e:
-            print(f"Stream error: {e}")
-            print("Reconnecting in 5 seconds...")
+            print(f"Stream error: {e}", flush=True)
+            print("Reconnecting in 5 seconds...", flush=True)
             await asyncio.sleep(5)
+
+
+# Global state
+db_conn_global: Optional[aiosqlite.Connection] = None
 
 
 async def get_today_count():
     """Get count of companies matched today"""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    cursor = await db_conn.execute(
+    cursor = await db_conn_global.execute(
         "SELECT COUNT(*) FROM screened_companies WHERE DATE(published_at) = ?",
         (today,)
     )
@@ -244,7 +249,7 @@ async def get_today_count():
 
 async def get_recent_companies(limit: int = 100):
     """Get most recent companies"""
-    cursor = await db_conn.execute(
+    cursor = await db_conn_global.execute(
         """
         SELECT company_number, company_name, sic_codes, source_type, published_at
         FROM screened_companies
@@ -276,11 +281,12 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 @app.on_event("startup")
 async def startup():
     """Initialize database and start stream processor"""
-    global db_conn
+    global db_conn, db_conn_global
     
-    print("Starting Companies House Monitor...")
+    print("Starting Companies House Monitor...", flush=True)
     db_conn = await get_db_connection()
-    print(f"Database initialized: {DATABASE_FILE}")
+    db_conn_global = db_conn
+    print(f"Database initialized: {DATABASE_FILE}", flush=True)
     
     # Start stream processor in background
     asyncio.create_task(process_stream())
