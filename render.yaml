@@ -11,7 +11,7 @@ services:
       - key: API_KEY
         sync: false
       - key: SSE_URL
-        value: https://stream.companieshouse.gov.uk/
+        value: https://stream.companieshouse.gov.uk/companies
       - key: DATABASE_FILE
         value: /data/companies.db
       - key: PORT
